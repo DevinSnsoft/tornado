@@ -23,6 +23,8 @@ import psycopg2
 import re
 import tornado
 import unicodedata
+import sys
+import asyncpg
 
 from tornado.options import define, options
 
@@ -30,8 +32,8 @@ define("port", default=8888, help="run on the given port", type=int)
 define("db_host", default="127.0.0.1", help="blog database host")
 define("db_port", default=5432, help="blog database port")
 define("db_database", default="blog", help="blog database name")
-define("db_user", default="blog", help="blog database user")
-define("db_password", default="blog", help="blog database password")
+define("db_user", default="postgres", help="blog database user")
+define("db_password", default="123456", help="blog database password")
 
 
 class NoResultError(Exception):
@@ -40,14 +42,11 @@ class NoResultError(Exception):
 
 async def maybe_create_tables(db):
     try:
-        with await db.cursor() as cur:
-            await cur.execute("SELECT COUNT(*) FROM entries LIMIT 1")
-            await cur.fetchone()
-    except psycopg2.ProgrammingError:
+        await db.fetchval("SELECT COUNT(*) FROM entries LIMIT 1")
+    except:
         with open("schema.sql") as f:
             schema = f.read()
-        with await db.cursor() as cur:
-            await cur.execute(schema)
+        await db.execute(schema)
 
 
 class Application(tornado.web.Application):
@@ -77,60 +76,48 @@ class Application(tornado.web.Application):
 
 
 class BaseHandler(tornado.web.RequestHandler):
-    def row_to_obj(self, row, cur):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._current_user = None
+
+    def row_to_obj(self, row):
         """Convert a SQL row to an object supporting dict and attribute access."""
         obj = tornado.util.ObjectDict()
-        for val, desc in zip(row, cur.description):
-            obj[desc.name] = val
+        for key, value in row.items():
+            obj[key] = value
         return obj
-
-    async def execute(self, stmt, *args):
-        """Execute a SQL statement.
-
-        Must be called with ``await self.execute(...)``
-        """
-        with await self.application.db.cursor() as cur:
-            await cur.execute(stmt, args)
-
-    async def query(self, stmt, *args):
-        """Query for a list of results.
-
-        Typical usage::
-
-            results = await self.query(...)
-
-        Or::
-
-            for row in await self.query(...)
-        """
-        with await self.application.db.cursor() as cur:
-            await cur.execute(stmt, args)
-            return [self.row_to_obj(row, cur) for row in await cur.fetchall()]
-
-    async def queryone(self, stmt, *args):
-        """Query for exactly one result.
-
-        Raises NoResultError if there are no results, or ValueError if
-        there are more than one.
-        """
-        results = await self.query(stmt, *args)
-        if len(results) == 0:
-            raise NoResultError()
-        elif len(results) > 1:
-            raise ValueError("Expected 1 result, got %d" % len(results))
-        return results[0]
 
     async def prepare(self):
         # get_current_user cannot be a coroutine, so set
         # self.current_user in prepare instead.
         user_id = self.get_signed_cookie("blogdemo_user")
         if user_id:
-            self.current_user = await self.queryone(
-                "SELECT * FROM authors WHERE id = %s", int(user_id)
-            )
+            try:
+                row = await self.queryone(
+                    "SELECT * FROM authors WHERE id = $1", int(user_id)
+                )
+                self._current_user = self.row_to_obj(row)
+            except NoResultError:
+                self._current_user = None
+
+    async def execute(self, stmt, *args):
+        await self.application.db.execute(stmt, *args)
+
+    async def query(self, stmt, *args):
+        rows = await self.application.db.fetch(stmt, *args)
+        return [self.row_to_obj(row) for row in rows]
+
+    async def queryone(self, stmt, *args):
+        row = await self.application.db.fetchrow(stmt, *args)
+        if not row:
+            raise NoResultError()
+        return dict(row)  # 保持为字典，在需要时转换为 ObjectDict
 
     async def any_author_exists(self):
         return bool(await self.query("SELECT * FROM authors LIMIT 1"))
+
+    def get_current_user(self):
+        return self._current_user
 
 
 class HomeHandler(BaseHandler):
@@ -146,10 +133,12 @@ class HomeHandler(BaseHandler):
 
 class EntryHandler(BaseHandler):
     async def get(self, slug):
-        entry = await self.queryone("SELECT * FROM entries WHERE slug = %s", slug)
-        if not entry:
+        try:
+            row = await self.queryone("SELECT * FROM entries WHERE slug = $1", slug)
+            entry = self.row_to_obj(row)
+            self.render("entry.html", entry=entry)
+        except NoResultError:
             raise tornado.web.HTTPError(404)
-        self.render("entry.html", entry=entry)
 
 
 class ArchiveHandler(BaseHandler):
@@ -173,7 +162,11 @@ class ComposeHandler(BaseHandler):
         id = self.get_argument("id", None)
         entry = None
         if id:
-            entry = await self.queryone("SELECT * FROM entries WHERE id = %s", int(id))
+            try:
+                row = await self.queryone("SELECT * FROM entries WHERE id = $1", int(id))
+                entry = self.row_to_obj(row)
+            except NoResultError:
+                raise tornado.web.HTTPError(404)
         self.render("compose.html", entry=entry)
 
     @tornado.web.authenticated
@@ -182,17 +175,19 @@ class ComposeHandler(BaseHandler):
         title = self.get_argument("title")
         text = self.get_argument("markdown")
         html = markdown.markdown(text)
+
         if id:
             try:
-                entry = await self.queryone(
-                    "SELECT * FROM entries WHERE id = %s", int(id)
+                row = await self.queryone(
+                    "SELECT * FROM entries WHERE id = $1", int(id)
                 )
+                entry = self.row_to_obj(row)
             except NoResultError:
                 raise tornado.web.HTTPError(404)
             slug = entry.slug
             await self.execute(
-                "UPDATE entries SET title = %s, markdown = %s, html = %s "
-                "WHERE id = %s",
+                "UPDATE entries SET title = $1, markdown = $2, html = $3 "
+                "WHERE id = $4",
                 title,
                 text,
                 html,
@@ -206,13 +201,13 @@ class ComposeHandler(BaseHandler):
             if not slug:
                 slug = "entry"
             while True:
-                e = await self.query("SELECT * FROM entries WHERE slug = %s", slug)
+                e = await self.query("SELECT * FROM entries WHERE slug = $1", slug)
                 if not e:
                     break
                 slug += "-2"
             await self.execute(
                 "INSERT INTO entries (author_id,title,slug,markdown,html,published,updated)"
-                "VALUES (%s,%s,%s,%s,%s,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                "VALUES ($1,$2,$3,$4,$5,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
                 self.current_user.id,
                 title,
                 slug,
@@ -235,13 +230,14 @@ class AuthCreateHandler(BaseHandler):
             tornado.escape.utf8(self.get_argument("password")),
             bcrypt.gensalt(),
         )
-        author = await self.queryone(
+        row = await self.queryone(
             "INSERT INTO authors (email, name, hashed_password) "
-            "VALUES (%s, %s, %s) RETURNING id",
+            "VALUES ($1, $2, $3) RETURNING id",
             self.get_argument("email"),
             self.get_argument("name"),
             tornado.escape.to_unicode(hashed_password),
         )
+        author = self.row_to_obj(row)
         self.set_signed_cookie("blogdemo_user", str(author.id))
         self.redirect(self.get_argument("next", "/"))
 
@@ -256,12 +252,14 @@ class AuthLoginHandler(BaseHandler):
 
     async def post(self):
         try:
-            author = await self.queryone(
-                "SELECT * FROM authors WHERE email = %s", self.get_argument("email")
+            row = await self.queryone(
+                "SELECT * FROM authors WHERE email = $1", self.get_argument("email")
             )
+            author = self.row_to_obj(row)
         except NoResultError:
             self.render("login.html", error="email not found")
             return
+
         password_equal = await tornado.ioloop.IOLoop.current().run_in_executor(
             None,
             bcrypt.checkpw,
@@ -287,25 +285,31 @@ class EntryModule(tornado.web.UIModule):
 
 
 async def main():
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     tornado.options.parse_command_line()
 
-    # Create the global connection pool.
-    async with aiopg.create_pool(
+    # 使用asyncpg替代aiopg
+    conn = await asyncpg.connect(
         host=options.db_host,
         port=options.db_port,
         user=options.db_user,
         password=options.db_password,
-        dbname=options.db_database,
-    ) as db:
-        await maybe_create_tables(db)
-        app = Application(db)
-        app.listen(options.port)
+        database=options.db_database,
+    )
 
-        # In this demo the server will simply run until interrupted
-        # with Ctrl-C, but if you want to shut down more gracefully,
-        # call shutdown_event.set().
-        shutdown_event = tornado.locks.Event()
-        await shutdown_event.wait()
+    try:
+        await maybe_create_tables(conn)
+        app = Application(conn)
+        app.listen(options.port)
+        print(f"Server started on http://localhost:{options.port}")
+
+        # 保持服务器运行
+        await asyncio.Event().wait()
+    except KeyboardInterrupt:
+        print("Server stopped")
+    finally:
+        await conn.close()
 
 
 if __name__ == "__main__":
